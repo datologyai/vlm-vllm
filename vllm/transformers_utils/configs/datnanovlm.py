@@ -7,7 +7,7 @@ from transformers import AutoConfig
 from vllm.transformers_utils.configs.isaac import IsaacConfig
 
 
-class DatnaNoVLMConfig(IsaacConfig):
+class DatNanoVLMConfig(IsaacConfig):
     """Config adapter for datnanovlm SigLIP2/Qwen3 native-res checkpoints.
 
     This parses the datnanovlm HF schema directly (model_type=datnanovlm)
@@ -43,7 +43,7 @@ class DatnaNoVLMConfig(IsaacConfig):
             vision_config = {}
 
         if "architectures" not in kwargs:
-            kwargs["architectures"] = ["DatnaNoVLMForConditionalGeneration"]
+            kwargs["architectures"] = ["DatNanoVLMForConditionalGeneration"]
 
         if image_tokens_per_image is not None and "vision_max_num_patches" not in kwargs:
             kwargs["vision_max_num_patches"] = int(image_tokens_per_image)

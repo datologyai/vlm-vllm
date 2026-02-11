@@ -17,8 +17,8 @@ from .isaac import (
     info=IsaacProcessingInfo,
     dummy_inputs=IsaacDummyInputsBuilder,
 )
-class DatnaNoVLMForConditionalGeneration(IsaacForConditionalGeneration):
-    """DatnaNoVLM native architecture entrypoint.
+class DatNanoVLMForConditionalGeneration(IsaacForConditionalGeneration):
+    """DatNanoVLM native architecture entrypoint.
 
     This keeps runtime behavior aligned with Isaac-derived multimodal execution
     while allowing explicit  / architecture routing.

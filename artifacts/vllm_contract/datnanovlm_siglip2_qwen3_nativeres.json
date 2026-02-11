@@ -1,6 +1,6 @@
 {
   "model_type": "datnanovlm",
-  "architectures": ["DatnaNoVLMForConditionalGeneration"],
+  "architectures": ["DatNanoVLMForConditionalGeneration"],
   "config_fields": {
     "required": [
       "model_type",

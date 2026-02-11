@@ -26,7 +26,7 @@ _CLASS_TO_MODULE: dict[str, str] = {
     "HunYuanVLTextConfig": "vllm.transformers_utils.configs.hunyuan_vl",
     "HunYuanVLVisionConfig": "vllm.transformers_utils.configs.hunyuan_vl",
     "IsaacConfig": "vllm.transformers_utils.configs.isaac",
-    "DatnaNoVLMConfig": "vllm.transformers_utils.configs.datnanovlm",
+    "DatNanoVLMConfig": "vllm.transformers_utils.configs.datnanovlm",
     # RWConfig is for the original tiiuae/falcon-40b(-instruct) and
     # tiiuae/falcon-7b(-instruct) models. Newer Falcon models will use the
     # `FalconConfig` class from the official HuggingFace transformers library.
@@ -72,7 +72,7 @@ __all__ = [
     "HunYuanVLTextConfig",
     "HunYuanVLVisionConfig",
     "IsaacConfig",
-    "DatnaNoVLMConfig",
+    "DatNanoVLMConfig",
     "RWConfig",
     "JAISConfig",
     "Lfm2MoeConfig",
