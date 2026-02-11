@@ -53,7 +53,12 @@ from vllm.multimodal.inputs import (
     MultiModalFieldConfig,
     MultiModalKwargsItems,
 )
-from vllm.multimodal.parse import ImageSize, MultiModalDataItems
+from vllm.multimodal.parse import (
+    ImageEmbeddingItems,
+    ImageProcessorItems,
+    ImageSize,
+    MultiModalDataItems,
+)
 from vllm.multimodal.processing import (
     BaseDummyInputsBuilder,
     BaseMultiModalProcessor,
@@ -72,6 +77,11 @@ from vllm.transformers_utils.configs import (
 )
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
 
+from .internvl import (
+    calculate_internvl_targets,
+    dynamic_preprocess_internvl,
+    get_internvl_target_ratios,
+)
 from .vision import is_vit_use_data_parallel
 
 
@@ -175,7 +185,7 @@ class Siglip2VariableSequenceEmbeddings(nn.Module):
 def create_pixel_shuffle_index_map(
     seq_sizes: torch.Tensor,
     token_grids: torch.Tensor,
-    scale_factor: int = 1,
+    scale_factor: int | tuple[int, int] = 1,
     device: torch.device | None = None,
 ) -> torch.Tensor:
     """
@@ -199,18 +209,24 @@ def create_pixel_shuffle_index_map(
     if device is None:
         device = seq_sizes.device
 
-    r = int(scale_factor)
-    if r < 2:
+    if isinstance(scale_factor, int):
+        rh = int(scale_factor)
+        rw = int(scale_factor)
+    else:
+        rh = int(scale_factor[0])
+        rw = int(scale_factor[1])
+
+    if rh < 2 and rw < 2:
         raise ValueError("`scale_factor` must be ≥ 2")
 
     # Safety: all spatial dims must be divisible by r
     # Cannot run under torch compile fullgraph mode hence
     if not torch.compiler.is_compiling() and not (
-        (token_grids[:, 0] % r == 0).all() and (token_grids[:, 1] % r == 0).all()
+        (token_grids[:, 0] % rh == 0).all() and (token_grids[:, 1] % rw == 0).all()
     ):
         raise AssertionError(
             "Every (H,W) in `token_grids` must be divisible by "
-            f"scale_factor={r}, got {token_grids.tolist()}"
+            f"scale_factor=({rh}, {rw}), got {token_grids.tolist()}"
         )
 
     gather_chunks: list[torch.Tensor] = []
@@ -222,14 +238,14 @@ def create_pixel_shuffle_index_map(
         grid = grid.view(h, w)  # (H, W)
 
         # -------- identical ordering to your fixed-res routine --------
-        # Step 1: split width into blocks of r
-        grid = grid.view(h, w // r, r)  # (H, W/r, r)
-        # Step 2: now split height into blocks of r
-        grid = grid.view(h // r, r, w // r, r)  # (H/r, r, W/r, r)
-        # Step 3: final permutation to (H/r, W/r, r, r)
-        grid = grid.permute(0, 2, 1, 3).contiguous()  # (H/r, W/r, r, r)
-        # Step 4: each (r, r) block forms one output token
-        gather_chunks.append(grid.reshape(-1, r * r))  # (H*W / r², r²)
+        # Step 1: split width into blocks of rw
+        grid = grid.view(h, w // rw, rw)  # (H, W/rw, rw)
+        # Step 2: now split height into blocks of rh
+        grid = grid.view(h // rh, rh, w // rw, rw)  # (H/rh, rh, W/rw, rw)
+        # Step 3: final permutation to (H/rh, W/rw, rh, rw)
+        grid = grid.permute(0, 2, 1, 3).contiguous()  # (H/rh, W/rw, rh, rw)
+        # Step 4: each (rh, rw) block forms one output token
+        gather_chunks.append(grid.reshape(-1, rh * rw))  # (H*W/(rh*rw), rh*rw)
 
         tok_offset += seq_len
 
@@ -241,7 +257,7 @@ def create_pixel_shuffle_index_map(
 def pixel_shuffle_varlen(
     x: torch.Tensor,
     token_grids: torch.Tensor,
-    scale_factor: int = 1,
+    scale_factor: int | tuple[int, int] = 1,
 ) -> torch.Tensor:
     r"""Apply pixel shuffle to a packed vision sequence without unpacking per image.
 
@@ -277,7 +293,12 @@ def pixel_shuffle_varlen(
         x_ = x  # (seq, embed)
 
     embed_dim = x_.size(-1)
-    r = int(scale_factor)
+    if isinstance(scale_factor, int):
+        rh = int(scale_factor)
+        rw = int(scale_factor)
+    else:
+        rh = int(scale_factor[0])
+        rw = int(scale_factor[1])
 
     # Calculate seq_sizes from token_grids
     seq_sizes = torch.prod(token_grids, dim=-1)
@@ -286,15 +307,15 @@ def pixel_shuffle_varlen(
     gather_idx = create_pixel_shuffle_index_map(
         seq_sizes=seq_sizes,
         token_grids=token_grids,
-        scale_factor=r,
+        scale_factor=(rh, rw),
         device=x_.device,
-    )  # (new_seq, r²)
+    )  # (new_seq, rh*rw)
 
-    # Gather → (new_seq, r², embed_dim)
+    # Gather → (new_seq, rh*rw, embed_dim)
     gathered = x_[gather_idx]  # fancy indexing keeps gradient
 
-    # Merge the r² group dimension into channels to finish the shuffle
-    out = gathered.reshape(gathered.size(0), embed_dim * r * r)
+    # Merge the (rh*rw) group dimension into channels to finish the shuffle.
+    out = gathered.reshape(gathered.size(0), embed_dim * rh * rw)
 
     # Restore batch dimension if needed
     if keep_batch_dim:
@@ -351,7 +372,7 @@ def get_image_size_for_max_num_patches(
     max_num_patches: int,
     min_num_patches: int | None = None,
     eps: float = 1e-5,
-    pixel_shuffle_scale: int = 1,
+    pixel_shuffle_scale: int | tuple[int, int] = 1,
 ) -> tuple[int, int]:
     r"""Compute a target resolution whose patch grid satisfies patching parametrization.
 
@@ -381,19 +402,26 @@ def get_image_size_for_max_num_patches(
         optional minimum patch-count constraints.
     """
 
-    def get_scaled_image_size(scale, original_size, patch_size, pixel_shuffle_scale):
+    if isinstance(pixel_shuffle_scale, int):
+        shuffle_h = int(pixel_shuffle_scale)
+        shuffle_w = int(pixel_shuffle_scale)
+    else:
+        shuffle_h = int(pixel_shuffle_scale[0])
+        shuffle_w = int(pixel_shuffle_scale[1])
+
+    def get_scaled_image_size(scale, original_size, divisor):
         scaled_size = scale * original_size
-        divisor = patch_size * pixel_shuffle_scale
         scaled_size = math.ceil(scaled_size / divisor) * divisor
         scaled_size = max(divisor, scaled_size)
         return int(scaled_size)
 
     # Ensure divisibility
-    divisor = patch_size * pixel_shuffle_scale
-    adjusted_height = math.ceil(image_height / divisor) * divisor
-    adjusted_height = max(divisor, adjusted_height)
-    adjusted_width = math.ceil(image_width / divisor) * divisor
-    adjusted_width = max(divisor, adjusted_width)
+    divisor_h = patch_size * shuffle_h
+    divisor_w = patch_size * shuffle_w
+    adjusted_height = math.ceil(image_height / divisor_h) * divisor_h
+    adjusted_height = max(divisor_h, adjusted_height)
+    adjusted_width = math.ceil(image_width / divisor_w) * divisor_w
+    adjusted_width = max(divisor_w, adjusted_width)
 
     num_patches = (adjusted_height / patch_size) * (adjusted_width / patch_size)
 
@@ -402,24 +430,16 @@ def get_image_size_for_max_num_patches(
         scale_min, scale_max = 1.0, 100.0
         while (scale_max - scale_min) >= eps:
             scale = (scale_min + scale_max) / 2
-            target_height = get_scaled_image_size(
-                scale, image_height, patch_size, pixel_shuffle_scale
-            )
-            target_width = get_scaled_image_size(
-                scale, image_width, patch_size, pixel_shuffle_scale
-            )
+            target_height = get_scaled_image_size(scale, image_height, divisor_h)
+            target_width = get_scaled_image_size(scale, image_width, divisor_w)
             num_patches = (target_height / patch_size) * (target_width / patch_size)
             if num_patches >= min_num_patches:
                 scale_max = scale
             else:
                 scale_min = scale
         scale = scale_max
-        target_height = get_scaled_image_size(
-            scale, image_height, patch_size, pixel_shuffle_scale
-        )
-        target_width = get_scaled_image_size(
-            scale, image_width, patch_size, pixel_shuffle_scale
-        )
+        target_height = get_scaled_image_size(scale, image_height, divisor_h)
+        target_width = get_scaled_image_size(scale, image_width, divisor_w)
         return target_height, target_width
     elif num_patches <= max_num_patches:
         return adjusted_height, adjusted_width
@@ -428,24 +448,16 @@ def get_image_size_for_max_num_patches(
         scale_min, scale_max = eps / 10, 1.0
         while (scale_max - scale_min) >= eps:
             scale = (scale_min + scale_max) / 2
-            target_height = get_scaled_image_size(
-                scale, image_height, patch_size, pixel_shuffle_scale
-            )
-            target_width = get_scaled_image_size(
-                scale, image_width, patch_size, pixel_shuffle_scale
-            )
+            target_height = get_scaled_image_size(scale, image_height, divisor_h)
+            target_width = get_scaled_image_size(scale, image_width, divisor_w)
             num_patches = (target_height / patch_size) * (target_width / patch_size)
             if num_patches <= max_num_patches:
                 scale_min = scale
             else:
                 scale_max = scale
         scale = scale_min
-        target_height = get_scaled_image_size(
-            scale, image_height, patch_size, pixel_shuffle_scale
-        )
-        target_width = get_scaled_image_size(
-            scale, image_width, patch_size, pixel_shuffle_scale
-        )
+        target_height = get_scaled_image_size(scale, image_height, divisor_h)
+        target_width = get_scaled_image_size(scale, image_width, divisor_w)
         return target_height, target_width
 
 
@@ -464,6 +476,43 @@ def _resolve_vision_token_id(model_config: ModelConfig, vision_token: str) -> in
         )
     )
     return tokenizer.encode(vision_token, add_special_tokens=False)[0]
+
+
+def _resolve_pixel_shuffle_factors(
+    value: int | Sequence[int] | None = None,
+    *,
+    config: IsaacConfig | PixelShuffleSiglip2VisionConfig | None = None,
+) -> tuple[int, int]:
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        if len(value) != 2:
+            raise ValueError(
+                "pixel shuffle sequence must contain exactly two integers: "
+                "[height_factor, width_factor]"
+            )
+        return int(value[0]), int(value[1])
+
+    if isinstance(value, int):
+        return int(value), int(value)
+
+    if config is None:
+        return 1, 1
+
+    if hasattr(config, "pixel_shuffle_factors"):
+        factors = config.pixel_shuffle_factors
+        if isinstance(factors, Sequence) and len(factors) == 2:
+            return int(factors[0]), int(factors[1])
+
+    factor_h = getattr(config, "pixel_shuffle_factor_height", None)
+    factor_w = getattr(config, "pixel_shuffle_factor_width", None)
+    if factor_h is not None or factor_w is not None:
+        if factor_h is None:
+            factor_h = factor_w
+        if factor_w is None:
+            factor_w = factor_h
+        return int(factor_h), int(factor_w)
+
+    scale = int(getattr(config, "pixel_shuffle_scale_factor", 1))
+    return scale, scale
 
 
 def prepare_image_tensor(
@@ -540,7 +589,7 @@ def process_vision_for_patches(
     patch_size: int,
     max_num_patches: int,
     min_num_patches: int | None = None,
-    pixel_shuffle_scale: int = 1,
+    pixel_shuffle_scale: int | tuple[int, int] = 1,
 ) -> tuple[torch.Tensor, list[int]]:
     r"""Resize, normalize, and patchify RGB images for the vision encoder.
 
@@ -567,6 +616,13 @@ def process_vision_for_patches(
         effective `(images, height, width)` dimensions after optional pixel
         shuffling.
     """
+    if isinstance(pixel_shuffle_scale, int):
+        shuffle_h = int(pixel_shuffle_scale)
+        shuffle_w = int(pixel_shuffle_scale)
+    else:
+        shuffle_h = int(pixel_shuffle_scale[0])
+        shuffle_w = int(pixel_shuffle_scale[1])
+
     # Add batch dim if single image
     if images.dim() == 3:
         images = images.unsqueeze(0)
@@ -582,7 +638,7 @@ def process_vision_for_patches(
         patch_size,
         max_num_patches,
         min_num_patches=min_num_patches,
-        pixel_shuffle_scale=pixel_shuffle_scale,
+        pixel_shuffle_scale=(shuffle_h, shuffle_w),
     )
 
     # Resize
@@ -606,8 +662,8 @@ def process_vision_for_patches(
     n_images, h_patches, w_patches, _ = patches.shape
     dims_virtual = (
         [1, h_patches, w_patches]
-        if pixel_shuffle_scale == 1
-        else [1, h_patches // pixel_shuffle_scale, w_patches // pixel_shuffle_scale]
+        if shuffle_h == 1 and shuffle_w == 1
+        else [1, h_patches // shuffle_h, w_patches // shuffle_w]
     )
 
     return patches, dims_virtual
@@ -618,6 +674,12 @@ class IsaacImageProcessorKwargs(TypedDict, total=False):
     max_num_patches: int
     min_num_patches: int
     pixel_shuffle_scale: int
+    pixel_shuffle_factors: tuple[int, int]
+    dynamic_image_size: bool
+    tile_size: int
+    min_num_tiles: int
+    max_num_tiles: int
+    use_thumbnail: bool
 
 
 class IsaacImageProcessor:
@@ -625,9 +687,14 @@ class IsaacImageProcessor:
     max_num_patches = 6144
     min_num_patches = 256
     pixel_shuffle_scale = 2
+    dynamic_image_size = False
+    tile_size = 384
+    min_num_tiles = 1
+    max_num_tiles = 12
+    use_thumbnail = True
 
-    valid_kwargs = IsaacImageProcessorKwargs
-    model_input_names = ["pixel_values", "image_grid_thw"]
+    valid_kwargs = IsaacImageProcessorKwargs  # type: ignore[assignment]
+    model_input_names = ["pixel_values", "image_grid_thw", "image_num_tiles"]
 
     def __init__(self, kwargs):
         self.patch_size = kwargs.pop("patch_size", self.patch_size)
@@ -637,7 +704,33 @@ class IsaacImageProcessor:
         self.vision_min_num_patches = kwargs.pop(
             "vision_min_num_patches", self.min_num_patches
         )
-        self.pixel_shuffle_scale = kwargs.pop("pixel_shuffle_scale", 2)
+        pixel_shuffle_value = kwargs.pop("pixel_shuffle_factors", None)
+        if pixel_shuffle_value is None:
+            pixel_shuffle_value = kwargs.pop(
+                "pixel_shuffle_scale", self.pixel_shuffle_scale
+            )
+        self.pixel_shuffle_factors = _resolve_pixel_shuffle_factors(pixel_shuffle_value)
+        self.dynamic_image_size = kwargs.pop(
+            "dynamic_image_size", self.dynamic_image_size
+        )
+        self.tile_size = kwargs.pop("tile_size", self.tile_size)
+        self.min_num_tiles = kwargs.pop("min_num_tiles", self.min_num_tiles)
+        self.max_num_tiles = kwargs.pop("max_num_tiles", self.max_num_tiles)
+        self.use_thumbnail = kwargs.pop("use_thumbnail", self.use_thumbnail)
+
+    def _resolve_tiles(self, image: PIL.Image.Image) -> list[PIL.Image.Image]:
+        if not self.dynamic_image_size:
+            return [image]
+
+        target_ratios = get_internvl_target_ratios(
+            self.min_num_tiles, self.max_num_tiles
+        )
+        return dynamic_preprocess_internvl(
+            image=image,
+            target_ratios=target_ratios,
+            image_size=self.tile_size,
+            use_thumbnail=self.use_thumbnail,
+        )
 
     def preprocess(
         self,
@@ -649,32 +742,38 @@ class IsaacImageProcessor:
 
         all_pixel_values: list[torch.Tensor] = []
         all_image_grids: list[torch.Tensor] = []
+        image_num_tiles: list[int] = []
 
         for image in images:
-            image_tensor = extract_image_pil(image)
+            tiles = self._resolve_tiles(image)
+            image_num_tiles.append(len(tiles))
 
-            patches, dims_virtual = process_vision_for_patches(
-                image_tensor,
-                patch_size=self.patch_size,
-                max_num_patches=self.vision_max_num_patches,
-                min_num_patches=self.vision_min_num_patches,
-                pixel_shuffle_scale=self.pixel_shuffle_scale,
-            )
+            for tile in tiles:
+                image_tensor = extract_image_pil(tile)
 
-            # Isaac packs a dummy temporal dim for images
-            patches = patches.unsqueeze(1)  # [N, T=1, Hp, Wp, D]
+                patches, _ = process_vision_for_patches(
+                    image_tensor,
+                    patch_size=self.patch_size,
+                    max_num_patches=self.vision_max_num_patches,
+                    min_num_patches=self.vision_min_num_patches,
+                    pixel_shuffle_scale=self.pixel_shuffle_factors,
+                )
 
-            hp, wp, dim = patches.shape[-3], patches.shape[-2], patches.shape[-1]
-            current_num_patches = hp * wp
-            pixel_values = patches.reshape(current_num_patches, dim)  # [N_tokens, D]
+                # Isaac packs a dummy temporal dim for images.
+                patches = patches.unsqueeze(1)  # [N, T=1, Hp, Wp, D]
 
-            # Use real patch dimensions for image_grid_thw, not virtual dimensions
-            # This ensures the vision model receives correct grid info for pixel shuffle
-            dims_real = [1, hp, wp]  # Real patch dimensions
-            image_grid_thw = torch.tensor(dims_real).unsqueeze(0)
+                hp, wp, dim = patches.shape[-3], patches.shape[-2], patches.shape[-1]
+                current_num_patches = hp * wp
+                pixel_values = patches.reshape(
+                    current_num_patches, dim
+                )  # [N_tokens, D]
 
-            all_pixel_values.append(pixel_values)
-            all_image_grids.append(image_grid_thw)
+                # Use real patch dimensions for image_grid_thw.
+                dims_real = [1, hp, wp]
+                image_grid_thw = torch.tensor(dims_real).unsqueeze(0)
+
+                all_pixel_values.append(pixel_values)
+                all_image_grids.append(image_grid_thw)
 
         if all_pixel_values:
             final_pixel_values = torch.cat(all_pixel_values, dim=0)
@@ -687,6 +786,7 @@ class IsaacImageProcessor:
             data={
                 "pixel_values": final_pixel_values,
                 "image_grid_thw": final_image_grids,
+                "image_num_tiles": torch.tensor(image_num_tiles, dtype=torch.int32),
             },
             tensor_type=return_tensors,
         )
@@ -706,6 +806,7 @@ class IsaacProcessor:
         if images is not None:
             image_inputs = self.image_processor.preprocess(images, **kwargs)
             image_grid_thw = image_inputs["image_grid_thw"]
+            image_num_tiles = image_inputs["image_num_tiles"]
             result.update(image_inputs)
 
             if text is not None:
@@ -713,15 +814,24 @@ class IsaacProcessor:
                     text = [text]
 
                 text = text.copy()  # below lines change text in-place
-                merge_length = self.image_processor.pixel_shuffle_scale**2
-                index = 0
+                factor_h, factor_w = self.image_processor.pixel_shuffle_factors
+                merge_length = factor_h * factor_w
+                tile_index = 0
+                source_image_index = 0
                 for i in range(len(text)):
                     while self.image_token in text[i]:
-                        num_image_tokens = image_grid_thw[index].prod() // merge_length
+                        num_tiles = int(image_num_tiles[source_image_index])
+                        total_tokens = 0
+                        for _ in range(num_tiles):
+                            total_tokens += int(image_grid_thw[tile_index].prod()) // (
+                                merge_length
+                            )
+                            tile_index += 1
+
                         text[i] = text[i].replace(
-                            self.image_token, "<|placeholder|>" * num_image_tokens, 1
+                            self.image_token, "<|placeholder|>" * total_tokens, 1
                         )
-                        index += 1
+                        source_image_index += 1
                     text[i] = text[i].replace("<|placeholder|>", "<|image_pad|>")
 
         if text is not None:
@@ -771,18 +881,25 @@ class IsaacProcessingInfo(BaseProcessingInfo):
     def get_hf_config(self) -> IsaacConfig:
         if hasattr(self.ctx, "get_hf_config"):
             original_config = self.ctx.get_hf_config()
-            # Map HF config parameters to our vLLM config parameters
+            factor_h, factor_w = _resolve_pixel_shuffle_factors(config=original_config)
+
             return IsaacConfig(
-                # Vision parameters - map from HF names
                 vision_config=getattr(original_config, "vision_config", None),
                 vision_patch_size=getattr(original_config, "video_patch_size", 16),
                 vision_max_num_patches=getattr(
-                    original_config, "vision_max_num_patches", 256
+                    original_config,
+                    "vision_max_num_patches",
+                    getattr(original_config, "num_patches", 256),
                 ),
                 vision_min_num_patches=getattr(
                     original_config, "vision_min_num_patches", None
                 ),
-                pixel_shuffle_scale=getattr(original_config, "pixel_shuffle_scale", 1),
+                pixel_shuffle_scale=getattr(
+                    original_config, "pixel_shuffle_scale", factor_h
+                ),
+                pixel_shuffle_factors=[factor_h, factor_w],
+                pixel_shuffle_factor_height=factor_h,
+                pixel_shuffle_factor_width=factor_w,
                 max_sequence_length=getattr(
                     original_config, "max_sequence_length", 16384
                 ),
@@ -790,13 +907,39 @@ class IsaacProcessingInfo(BaseProcessingInfo):
                 vision_attn_implementation=getattr(
                     original_config, "vision_attn_implementation", None
                 ),
+                dynamic_image_size=getattr(
+                    original_config, "dynamic_image_size", False
+                ),
+                tile_size=getattr(
+                    original_config,
+                    "tile_size",
+                    getattr(
+                        getattr(original_config, "vision_config", None),
+                        "image_size",
+                        384,
+                    ),
+                ),
+                min_num_tiles=getattr(original_config, "min_num_tiles", 1),
+                max_num_tiles=getattr(original_config, "max_num_tiles", 12),
+                use_thumbnail=getattr(original_config, "use_thumbnail", True),
             )
         return IsaacConfig()
 
     def get_hf_processor(self, **kwargs) -> IsaacProcessor:
         hf_config = self.get_hf_config()
+        factor_h, factor_w = _resolve_pixel_shuffle_factors(config=hf_config)
+
         processor_kwargs = {
             "image_token": hf_config.vision_token,
+            "patch_size": hf_config.video_patch_size,
+            "vision_max_num_patches": hf_config.vision_max_num_patches,
+            "vision_min_num_patches": hf_config.vision_min_num_patches,
+            "pixel_shuffle_factors": (factor_h, factor_w),
+            "dynamic_image_size": hf_config.dynamic_image_size,
+            "tile_size": hf_config.tile_size,
+            "min_num_tiles": hf_config.min_num_tiles,
+            "max_num_tiles": hf_config.max_num_tiles,
+            "use_thumbnail": hf_config.use_thumbnail,
         }
         processor_kwargs.update(kwargs)
         return self.ctx.get_hf_processor(IsaacProcessor, **processor_kwargs)
@@ -806,14 +949,24 @@ class IsaacProcessingInfo(BaseProcessingInfo):
 
     def get_image_size_with_most_features(self) -> ImageSize:
         hf_config = self.get_hf_config()
-        # Get target dimensions
+        if hf_config.dynamic_image_size:
+            ratios = get_internvl_target_ratios(
+                hf_config.min_num_tiles, hf_config.max_num_tiles
+            )
+            width_ratio, height_ratio = max(ratios, key=lambda x: x[0] * x[1])
+            return ImageSize(
+                width=hf_config.tile_size * width_ratio,
+                height=hf_config.tile_size * height_ratio,
+            )
+
+        factor_h, factor_w = _resolve_pixel_shuffle_factors(config=hf_config)
         target_height, target_width = get_image_size_for_max_num_patches(
             9999999,
             9999999,
             hf_config.video_patch_size,
             hf_config.vision_max_num_patches,
             min_num_patches=hf_config.vision_min_num_patches,
-            pixel_shuffle_scale=hf_config.pixel_shuffle_scale,
+            pixel_shuffle_scale=(factor_h, factor_w),
         )
         return ImageSize(width=target_width, height=target_height)
 
@@ -823,14 +976,57 @@ class IsaacProcessingInfo(BaseProcessingInfo):
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
         return {"image": None}
 
+    def get_num_image_tokens(
+        self,
+        *,
+        image_width: int,
+        image_height: int,
+        image_processor: IsaacImageProcessor | None = None,
+    ) -> int:
+        if image_processor is None:
+            image_processor = self.get_image_processor()
+
+        factor_h, factor_w = image_processor.pixel_shuffle_factors
+        merge_length = factor_h * factor_w
+        if image_processor.dynamic_image_size:
+            target_ratios = get_internvl_target_ratios(
+                image_processor.min_num_tiles,
+                image_processor.max_num_tiles,
+            )
+            num_tiles, _, _ = calculate_internvl_targets(
+                orig_width=image_width,
+                orig_height=image_height,
+                target_ratios=target_ratios,
+                image_size=image_processor.tile_size,
+                use_thumbnail=image_processor.use_thumbnail,
+            )
+            patches_per_tile = (
+                image_processor.tile_size // image_processor.patch_size
+            ) ** 2
+            return (patches_per_tile // merge_length) * num_tiles
+
+        target_height, target_width = get_image_size_for_max_num_patches(
+            image_height=image_height,
+            image_width=image_width,
+            patch_size=image_processor.patch_size,
+            max_num_patches=image_processor.vision_max_num_patches,
+            min_num_patches=image_processor.vision_min_num_patches,
+            pixel_shuffle_scale=(factor_h, factor_w),
+        )
+        num_patches = (target_height // image_processor.patch_size) * (
+            target_width // image_processor.patch_size
+        )
+        return num_patches // merge_length
+
     def get_mm_max_tokens_per_item(
         self,
         seq_len: int,
         mm_counts: Mapping[str, int],
     ) -> Mapping[str, int]:
-        hf_config = self.get_hf_config()
-        num_vision_tokens = hf_config.vision_max_num_patches // (
-            hf_config.pixel_shuffle_scale**2
+        target_size = self.get_image_size_with_most_features()
+        num_vision_tokens = self.get_num_image_tokens(
+            image_width=target_size.width,
+            image_height=target_size.height,
         )
         return {"image": num_vision_tokens}
 
@@ -890,6 +1086,11 @@ class IsaacImagePixelInputs(TensorSchema):
         TensorShape("ni", 3),
     ]
 
+    image_num_tiles: Annotated[
+        torch.Tensor,
+        TensorShape("ni"),
+    ]
+
 
 class IsaacMultiModalProcessor(BaseMultiModalProcessor):
     def _get_mm_fields_config(
@@ -897,15 +1098,39 @@ class IsaacMultiModalProcessor(BaseMultiModalProcessor):
         hf_inputs: BatchFeature,
         hf_processor_mm_kwargs: Mapping[str, object],
     ) -> Mapping[str, MultiModalFieldConfig]:
-        # Configure multimodal fields for Isaac model
         image_grid_thw = hf_inputs.get("image_grid_thw", torch.empty((0, 3)))
-        image_grid_sizes = image_grid_thw.prod(-1)
+        image_num_tiles = hf_inputs.get(
+            "image_num_tiles", torch.empty((0,), dtype=torch.int32)
+        )
 
+        if len(image_num_tiles) > 0:
+            pixel_sizes: list[int] = []
+            grid_sizes: list[int] = []
+            tile_offset = 0
+            for num_tiles in image_num_tiles.tolist():
+                tiles_for_image = int(num_tiles)
+                grid_chunk = image_grid_thw[tile_offset : tile_offset + tiles_for_image]
+                pixel_sizes.append(int(grid_chunk.prod(-1).sum()))
+                grid_sizes.append(tiles_for_image)
+                tile_offset += tiles_for_image
+
+            return {
+                "pixel_values": MultiModalFieldConfig.flat_from_sizes(
+                    "image", pixel_sizes
+                ),
+                "image_grid_thw": MultiModalFieldConfig.flat_from_sizes(
+                    "image", grid_sizes
+                ),
+                "image_num_tiles": MultiModalFieldConfig.batched("image"),
+            }
+
+        image_grid_sizes = image_grid_thw.prod(-1)
         return {
             "pixel_values": MultiModalFieldConfig.flat_from_sizes(
                 "image", image_grid_sizes
             ),
             "image_grid_thw": MultiModalFieldConfig.batched("image"),
+            "image_num_tiles": MultiModalFieldConfig.batched("image"),
         }
 
     def _get_prompt_updates(
@@ -916,15 +1141,20 @@ class IsaacMultiModalProcessor(BaseMultiModalProcessor):
     ) -> Sequence[PromptUpdate]:
         image_processor = self.info.get_image_processor(**hf_processor_mm_kwargs)
 
-        pixel_shuffle_scale = getattr(image_processor, "pixel_shuffle_scale", 2)
-        merge_length = pixel_shuffle_scale**2
-
         def get_replacement_isaac(item_idx: int):
-            out_item = out_mm_kwargs["image"][item_idx]
-            grid_thw = out_item["image_grid_thw"].data
-            assert isinstance(grid_thw, torch.Tensor)
+            images = mm_items.get_items(
+                "image", (ImageEmbeddingItems, ImageProcessorItems)
+            )
+            if isinstance(images, ImageEmbeddingItems):
+                feature_size = images.get_feature_size(item_idx)
+            else:
+                image_size = images.get_image_size(item_idx)
+                feature_size = self.info.get_num_image_tokens(
+                    image_width=image_size.width,
+                    image_height=image_size.height,
+                    image_processor=image_processor,
+                )
 
-            feature_size = int(grid_thw.prod()) // merge_length
             repl_full = "<|image_pad|>" * feature_size
             return PromptUpdateDetails.select_text(repl_full, "<|image_pad|>")
 
@@ -1126,7 +1356,7 @@ class Siglip2VisionTransformer(nn.Module):
         embed_dim = config.hidden_size
 
         self.embeddings = Siglip2VariableSequenceEmbeddings(config)
-        self.pixel_shuffle_scale_factor = config.pixel_shuffle_scale_factor
+        self.pixel_shuffle_factors = _resolve_pixel_shuffle_factors(config=config)
         self.encoder = Siglip2Encoder(
             config,
             quant_config=quant_config,
@@ -1164,11 +1394,11 @@ class Siglip2VisionTransformer(nn.Module):
         )
         hidden_states = self.post_layernorm(hidden_states)
 
-        if self.pixel_shuffle_scale_factor > 1:
+        if self.pixel_shuffle_factors != (1, 1):
             hidden_states = pixel_shuffle_varlen(
                 x=hidden_states,
                 token_grids=token_grids,
-                scale_factor=self.pixel_shuffle_scale_factor,
+                scale_factor=self.pixel_shuffle_factors,
             )
         # Remove the pseudo batch dimension we added earlier
         hidden_states = hidden_states.squeeze(0)
@@ -1352,7 +1582,9 @@ class IsaacForConditionalGeneration(
         if attn_impl is not None:
             vision_cfg._attn_implementation = attn_impl
 
-        hidden_dim = vision_cfg.hidden_size * (vision_cfg.pixel_shuffle_scale_factor**2)
+        factor_h, factor_w = _resolve_pixel_shuffle_factors(config=vision_cfg)
+        merge_length = factor_h * factor_w
+        hidden_dim = vision_cfg.hidden_size * merge_length
 
         with self._mark_tower_model(vllm_config, "image"):
             self.vision_embedding = IsaacVisionEmbedding(
@@ -1366,13 +1598,26 @@ class IsaacForConditionalGeneration(
     def iter_mm_grid_hw(
         self, input_tokens: list[int], mm_features: list[MultiModalFeatureSpec]
     ) -> Iterator[tuple[int, int, int]]:
-        spatial_merge_size = self.config.vision_config.pixel_shuffle_scale_factor
+        factor_h, factor_w = _resolve_pixel_shuffle_factors(
+            config=self.config.vision_config
+        )
         for mm_feature in sorted(mm_features, key=lambda f: f.mm_position.offset):
             offset = mm_feature.mm_position.offset
             if mm_feature.modality == "image":
-                t, h, w = mm_feature.data["image_grid_thw"].data.tolist()
-                assert t == 1, f"Image must have 1 frame, got {t}"
-                yield offset, h // spatial_merge_size, w // spatial_merge_size
+                grid_thw = mm_feature.data["image_grid_thw"].data
+                if isinstance(grid_thw, torch.Tensor):
+                    if grid_thw.ndim == 1:
+                        grid_thw = grid_thw.unsqueeze(0)
+
+                    tile_offset = offset
+                    for t, h, w in grid_thw.tolist():
+                        assert t == 1, f"Image must have 1 frame, got {t}"
+                        llm_h = h // factor_h
+                        llm_w = w // factor_w
+                        yield tile_offset, llm_h, llm_w
+                        tile_offset += llm_h * llm_w
+                else:
+                    raise TypeError("image_grid_thw must be a tensor")
             else:
                 raise ValueError(f"Unsupported modality: {mm_feature.modality}")
 
@@ -1414,13 +1659,19 @@ class IsaacForConditionalGeneration(
     ) -> IsaacImagePixelInputs | None:
         pixel_values = kwargs.get("pixel_values")
         image_grid_thw = kwargs.get("image_grid_thw")
+        image_num_tiles = kwargs.get("image_num_tiles")
         if pixel_values is None or image_grid_thw is None:
             return None
+        if image_num_tiles is None:
+            image_num_tiles = torch.ones(
+                image_grid_thw.shape[0], dtype=torch.int32, device=image_grid_thw.device
+            )
 
         # TensorSchema will automatically validate shapes on initialization
         return IsaacImagePixelInputs(
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
+            image_num_tiles=image_num_tiles,
         )
 
     def _process_image_input(
@@ -1429,6 +1680,7 @@ class IsaacForConditionalGeneration(
     ) -> tuple[torch.Tensor, ...]:
         pixel_values = image_input["pixel_values"]
         image_grid_thw = image_input["image_grid_thw"]
+        image_num_tiles = image_input["image_num_tiles"]
         if pixel_values.numel() == 0:
             return ()
 
@@ -1438,9 +1690,24 @@ class IsaacForConditionalGeneration(
         spatial_grids = image_grid_thw[:, 1:3].to(device, dtype=torch.int32)
 
         vision_embeddings = self.vision_embedding((pixel_values, spatial_grids))
-        merge_size = self.config.vision_config.pixel_shuffle_scale_factor
-        sizes = spatial_grids.prod(-1) // (merge_size * merge_size)
-        return tuple(vision_embeddings.split(sizes.tolist()))
+        factor_h, factor_w = _resolve_pixel_shuffle_factors(
+            config=self.config.vision_config
+        )
+        tile_feature_sizes = (spatial_grids.prod(-1) // (factor_h * factor_w)).tolist()
+        tile_embeddings = vision_embeddings.split(tile_feature_sizes)
+
+        grouped_embeddings: list[torch.Tensor] = []
+        tile_offset = 0
+        for num_tiles in image_num_tiles.tolist():
+            num_tiles = int(num_tiles)
+            grouped_embeddings.append(
+                torch.cat(
+                    list(tile_embeddings[tile_offset : tile_offset + num_tiles]), dim=0
+                )
+            )
+            tile_offset += num_tiles
+
+        return tuple(grouped_embeddings)
 
     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings | None:
         image_input = self._parse_and_validate_image_input(**kwargs)
