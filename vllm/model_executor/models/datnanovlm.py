@@ -8,13 +8,20 @@ from typing import Any
 from vllm.config import VllmConfig
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.parse import ImageEmbeddingItems, ImageProcessorItems
-from vllm.multimodal.processing import PromptReplacement, PromptUpdate, PromptUpdateDetails
+from vllm.multimodal.processing import (
+    PromptReplacement,
+    PromptUpdate,
+    PromptUpdateDetails,
+)
+
+from vllm.model_executor.models.utils import WeightsMapper
 
 from .isaac import (
     IsaacDummyInputsBuilder,
     IsaacForConditionalGeneration,
     IsaacMultiModalProcessor,
     IsaacProcessingInfo,
+    IsaacProcessor,
     MultiModalDataItems,
     MultiModalKwargsItems,
     _resolve_vision_token_id,
@@ -26,6 +33,97 @@ IMAGE_PAD_TOKEN = "<|image_pad|>"
 IMAGE_PLACEHOLDER_TOKEN = "<image>"
 
 
+class DatNanoVLMProcessor(IsaacProcessor):
+    """Processor wrapper with training-aligned conversation/tag normalization."""
+
+    @staticmethod
+    def _is_image_item(content_item: dict[str, Any]) -> bool:
+        item_type = content_item.get("type")
+        return item_type in {"image", "image_url", "input_image"}
+
+    @staticmethod
+    def _is_text_item(content_item: dict[str, Any]) -> bool:
+        item_type = content_item.get("type")
+        return item_type in {"text", "input_text"}
+
+    def _to_text_messages(
+        self, messages: list[dict[str, Any]]
+    ) -> tuple[list[dict[str, str]], int]:
+        processed: list[dict[str, str]] = []
+        total_images = 0
+
+        for message in messages:
+            role = message.get("role", "user")
+            content = message.get("content", "")
+
+            if isinstance(content, list):
+                text_parts: list[str] = []
+                for item in content:
+                    if self._is_text_item(item):
+                        text_parts.append(item.get("text", ""))
+                    elif self._is_image_item(item):
+                        text_parts.append(IMAGE_PLACEHOLDER_TOKEN)
+                        total_images += 1
+                processed.append({"role": role, "content": "".join(text_parts)})
+                continue
+
+                # no break
+            text = str(content)
+            processed.append({"role": role, "content": text})
+
+        return processed, total_images
+
+    @staticmethod
+    def _count_placeholders(messages: list[dict[str, str]]) -> int:
+        return sum(
+            msg.get("content", "").count(IMAGE_PLACEHOLDER_TOKEN) for msg in messages
+        )
+
+    @staticmethod
+    def _strip_all_placeholders(messages: list[dict[str, str]]) -> None:
+        for msg in messages:
+            msg["content"] = msg.get("content", "").replace(IMAGE_PLACEHOLDER_TOKEN, "")
+
+    @staticmethod
+    def _inject_placeholders_first_user(
+        messages: list[dict[str, str]], num_images: int
+    ) -> bool:
+        prefix = (IMAGE_PLACEHOLDER_TOKEN + " ") * num_images
+        for msg in messages:
+            if msg.get("role") in {"user", "human"}:
+                msg["content"] = prefix + msg.get("content", "")
+                return True
+        return False
+
+    def apply_chat_template(
+        self,
+        messages: list[dict[str, Any]],
+        tokenize: bool = False,
+        add_generation_prompt: bool = False,
+        **kwargs,
+    ) -> Any:
+        processed_messages, images_from_typed_content = self._to_text_messages(messages)
+        placeholder_count = self._count_placeholders(processed_messages)
+
+        if (
+            images_from_typed_content > 0
+            and placeholder_count != images_from_typed_content
+        ):
+            self._strip_all_placeholders(processed_messages)
+            inserted = self._inject_placeholders_first_user(
+                processed_messages, images_from_typed_content
+            )
+            if not inserted:
+                raise ValueError("No user message found to insert image placeholders")
+
+        return self.tokenizer.apply_chat_template(
+            processed_messages,
+            tokenize=tokenize,
+            add_generation_prompt=add_generation_prompt,
+            **kwargs,
+        )
+
+
 class DatNanoVLMProcessingInfo(IsaacProcessingInfo):
     """DatNanoVLM processing contract aligned with training data pipeline.
 
@@ -34,9 +132,26 @@ class DatNanoVLMProcessingInfo(IsaacProcessingInfo):
     """
 
     def get_hf_processor(self, **kwargs):
-        # Keep external contract stable for prompts/messages.
-        kwargs["image_token"] = IMAGE_PLACEHOLDER_TOKEN
-        return super().get_hf_processor(**kwargs)
+        hf_config = self.get_hf_config()
+        factor_h, factor_w = (
+            hf_config.pixel_shuffle_factor_height,
+            hf_config.pixel_shuffle_factor_width,
+        )
+
+        processor_kwargs = {
+            "image_token": IMAGE_PLACEHOLDER_TOKEN,
+            "patch_size": hf_config.video_patch_size,
+            "vision_max_num_patches": hf_config.vision_max_num_patches,
+            "vision_min_num_patches": hf_config.vision_min_num_patches,
+            "pixel_shuffle_factors": (factor_h, factor_w),
+            "dynamic_image_size": hf_config.dynamic_image_size,
+            "tile_size": hf_config.tile_size,
+            "min_num_tiles": hf_config.min_num_tiles,
+            "max_num_tiles": hf_config.max_num_tiles,
+            "use_thumbnail": hf_config.use_thumbnail,
+        }
+        processor_kwargs.update(kwargs)
+        return self.ctx.get_hf_processor(DatNanoVLMProcessor, **processor_kwargs)
 
 
 class DatNanoVLMMultiModalProcessor(IsaacMultiModalProcessor):
@@ -63,7 +178,9 @@ class DatNanoVLMMultiModalProcessor(IsaacMultiModalProcessor):
                 )
 
             repl_full = (
-                VISION_START_TOKEN + (IMAGE_PAD_TOKEN * feature_size) + VISION_END_TOKEN
+                VISION_START_TOKEN
+                + (IMAGE_PAD_TOKEN * feature_size)
+                + VISION_END_TOKEN
             )
             return PromptUpdateDetails.select_text(repl_full, IMAGE_PAD_TOKEN)
 
@@ -83,6 +200,32 @@ class DatNanoVLMMultiModalProcessor(IsaacMultiModalProcessor):
 )
 class DatNanoVLMForConditionalGeneration(IsaacForConditionalGeneration):
     """DatNanoVLM native architecture entrypoint."""
+
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_prefix={
+            "lm_head.": "language_model.lm_head.",
+            "model.text_model.lm_head.": "language_model.lm_head.",
+            "model.text_model.": "language_model.model.",
+            "model.vision_embedding.0": "vision_embedding.transformer",
+            "model.vision_embedding.1": "vision_embedding.linear_fc1",
+            "model.vision_embedding.2": "vision_embedding.act",
+            "model.vision_embedding.3": "vision_embedding.linear_fc2",
+            "model.vision_embedding.": "vision_embedding.",
+            "model.lm_head.": "language_model.lm_head.",
+            "model.": "language_model.model.",
+            "llm_backbone.lm_head.": "language_model.lm_head.",
+            "llm_backbone.model.": "language_model.model.",
+            "llm_backbone.": "language_model.",
+            "vision_backbone.model.head.": None,
+            "vision_backbone.vision_model.": None,
+            "vision_backbone.model.": "vision_embedding.transformer.",
+            "projector.layers.0.": "vision_embedding.layers.0.",
+            "projector.layers.1.": "vision_embedding.layers.1.",
+            "projector.layers.3.": "vision_embedding.layers.3.",
+            "projector.layers.4.": "vision_embedding.layers.4.",
+            "projector.layers.": None,
+        }
+    )
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:

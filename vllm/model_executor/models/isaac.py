@@ -1610,17 +1610,6 @@ class IsaacForConditionalGeneration(
             "model.vision_embedding.": "vision_embedding.",
             "model.lm_head.": "language_model.lm_head.",
             "model.": "language_model.model.",
-            "llm_backbone.lm_head.": "language_model.lm_head.",
-            "llm_backbone.model.": "language_model.model.",
-            "llm_backbone.": "language_model.",
-            "vision_backbone.model.head.": None,
-            "vision_backbone.vision_model.": None,
-            "vision_backbone.model.": "vision_embedding.transformer.",
-            "projector.layers.0.": "vision_embedding.layers.0.",
-            "projector.layers.1.": "vision_embedding.layers.1.",
-            "projector.layers.3.": "vision_embedding.layers.3.",
-            "projector.layers.4.": "vision_embedding.layers.4.",
-            "projector.layers.": None,
         }
     )
 
