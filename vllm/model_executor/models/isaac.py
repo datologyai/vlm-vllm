@@ -1068,12 +1068,14 @@ class IsaacImagePixelInputs(TensorSchema):
     Dimensions:
         - np: Number of patches
         - d: Patch dimension
+        - nt: Number of tiles
         - ni: Number of images
 
     The schema enforces:
         - pixel_values must be 2D: (num_patches, patch_dim)
-        - image_grid_thw must be 2D: (num_images, 3)
+        - image_grid_thw must be 2D: (num_tiles, 3)
           where 3 represents [T, H, W]
+        - image_num_tiles must be 1D: (num_images,)
     """
 
     pixel_values: Annotated[
@@ -1083,7 +1085,7 @@ class IsaacImagePixelInputs(TensorSchema):
 
     image_grid_thw: Annotated[
         torch.Tensor,
-        TensorShape("ni", 3),
+        TensorShape("nt", 3),
     ]
 
     image_num_tiles: Annotated[
@@ -1113,13 +1115,19 @@ class IsaacMultiModalProcessor(BaseMultiModalProcessor):
                 pixel_sizes.append(int(grid_chunk.prod(-1).sum()))
                 grid_sizes.append(tiles_for_image)
                 tile_offset += tiles_for_image
+            pixel_sizes_tensor = torch.tensor(
+                pixel_sizes, dtype=torch.int32, device=image_grid_thw.device
+            )
+            grid_sizes_tensor = torch.tensor(
+                grid_sizes, dtype=torch.int32, device=image_grid_thw.device
+            )
 
             return {
                 "pixel_values": MultiModalFieldConfig.flat_from_sizes(
-                    "image", pixel_sizes
+                    "image", pixel_sizes_tensor
                 ),
                 "image_grid_thw": MultiModalFieldConfig.flat_from_sizes(
-                    "image", grid_sizes
+                    "image", grid_sizes_tensor
                 ),
                 "image_num_tiles": MultiModalFieldConfig.batched("image"),
             }
@@ -1428,6 +1436,52 @@ class Siglip2VisionTransformer(nn.Module):
                 break
             else:
                 param = params_dict[name]
+                # HF checkpoints store SigLIP patch embeddings as Conv2D
+                # kernels [out, in, kh, kw], while vLLM consumes a flattened
+                # linear projection [out, in*kh*kw].
+                if (
+                    name.endswith("embeddings.patch_embedding.weight")
+                    and loaded_weight.ndim == 4
+                ):
+                    loaded_weight = loaded_weight.flatten(1)
+                if (
+                    name.endswith("embeddings.position_embedding.weight")
+                    and loaded_weight.ndim == 2
+                    and loaded_weight.shape != param.shape
+                ):
+                    old_num_patches, hidden_size = loaded_weight.shape
+                    new_num_patches, new_hidden_size = param.shape
+                    if hidden_size != new_hidden_size:
+                        raise ValueError(
+                            "Position embedding hidden size mismatch: "
+                            f"{hidden_size} vs {new_hidden_size}"
+                        )
+                    old_grid = int(math.isqrt(old_num_patches))
+                    new_grid = int(math.isqrt(new_num_patches))
+                    if old_grid * old_grid != old_num_patches:
+                        raise ValueError(
+                            "Old position embeddings are not square: "
+                            f"{old_num_patches}"
+                        )
+                    if new_grid * new_grid != new_num_patches:
+                        raise ValueError(
+                            "New position embeddings are not square: "
+                            f"{new_num_patches}"
+                        )
+                    loaded_weight = (
+                        F.interpolate(
+                            loaded_weight.view(old_grid, old_grid, hidden_size)
+                            .permute(2, 0, 1)
+                            .unsqueeze(0),
+                            size=(new_grid, new_grid),
+                            mode="bilinear",
+                            align_corners=False,
+                        )
+                        .squeeze(0)
+                        .permute(1, 2, 0)
+                        .reshape(new_num_patches, hidden_size)
+                        .to(dtype=param.dtype)
+                    )
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
             loaded_params.add(name)
@@ -1440,6 +1494,7 @@ class IsaacVisionEmbedding(nn.Module):
         vision_cfg: PixelShuffleSiglip2VisionConfig,
         hidden_dim: int,
         output_dim: int,
+        projector_config: Mapping[str, Any] | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ):
@@ -1449,31 +1504,74 @@ class IsaacVisionEmbedding(nn.Module):
             quant_config=quant_config,
             prefix=maybe_prefix(prefix, "0"),
         )
-        self.linear_fc1 = ColumnParallelLinear(
-            hidden_dim,
-            4 * hidden_dim,
-            bias=False,
-            quant_config=quant_config,
-            prefix=maybe_prefix(prefix, "1"),
-            return_bias=False,
-        )
-        self.act = nn.SiLU()
-        self.linear_fc2 = RowParallelLinear(
-            4 * hidden_dim,
-            output_dim,
-            bias=False,
-            quant_config=quant_config,
-            prefix=maybe_prefix(prefix, "3"),
-            return_bias=False,
-        )
+        projector_config = dict(projector_config or {})
+        projector_layers = int(projector_config.get("layers", 2))
+        projector_hidden_dim = int(projector_config.get("hidden_dim", 4 * hidden_dim))
+        projector_activation = str(projector_config.get("activation", "silu")).lower()
+
+        layers: list[nn.Module] = []
+        if projector_layers <= 1:
+            layers.append(
+                ReplicatedLinear(
+                    hidden_dim,
+                    output_dim,
+                    bias=True,
+                    return_bias=False,
+                )
+            )
+            layers.append(nn.LayerNorm(output_dim))
+        else:
+            layers.append(
+                ReplicatedLinear(
+                    hidden_dim,
+                    projector_hidden_dim,
+                    bias=True,
+                    return_bias=False,
+                )
+            )
+            layers.append(nn.LayerNorm(projector_hidden_dim))
+            layers.append(self._get_projector_activation(projector_activation))
+            for _ in range(projector_layers - 2):
+                layers.append(
+                    ReplicatedLinear(
+                        projector_hidden_dim,
+                        projector_hidden_dim,
+                        bias=True,
+                        return_bias=False,
+                    )
+                )
+                layers.append(nn.LayerNorm(projector_hidden_dim))
+                layers.append(self._get_projector_activation(projector_activation))
+            layers.append(
+                ReplicatedLinear(
+                    projector_hidden_dim,
+                    output_dim,
+                    bias=True,
+                    return_bias=False,
+                )
+            )
+            layers.append(nn.LayerNorm(output_dim))
+
+        self.layers = nn.Sequential(*layers)
+        # Backward-compatible aliases used by existing mapping and connector config.
+        self.linear_fc1 = self.layers[0]
+        self.linear_fc2 = self.layers[-2] if len(self.layers) > 1 else self.layers[0]
+
+    @staticmethod
+    def _get_projector_activation(activation: str) -> nn.Module:
+        if activation == "relu":
+            return nn.ReLU()
+        if activation == "silu":
+            return nn.SiLU()
+        if activation == "tanh":
+            return nn.Tanh()
+        return nn.GELU()
 
     def forward(
         self, packed_seq_patches: tuple[torch.Tensor, torch.Tensor]
     ) -> torch.Tensor:
         hidden_states = self.transformer(packed_seq_patches)
-        hidden_states = self.linear_fc1(hidden_states)
-        hidden_states = self.act(hidden_states)
-        hidden_states = self.linear_fc2(hidden_states)
+        hidden_states = self.layers(hidden_states)
         return hidden_states
 
 
@@ -1512,6 +1610,17 @@ class IsaacForConditionalGeneration(
             "model.vision_embedding.": "vision_embedding.",
             "model.lm_head.": "language_model.lm_head.",
             "model.": "language_model.model.",
+            "llm_backbone.lm_head.": "language_model.lm_head.",
+            "llm_backbone.model.": "language_model.model.",
+            "llm_backbone.": "language_model.",
+            "vision_backbone.model.head.": None,
+            "vision_backbone.vision_model.": None,
+            "vision_backbone.model.": "vision_embedding.transformer.",
+            "projector.layers.0.": "vision_embedding.layers.0.",
+            "projector.layers.1.": "vision_embedding.layers.1.",
+            "projector.layers.3.": "vision_embedding.layers.3.",
+            "projector.layers.4.": "vision_embedding.layers.4.",
+            "projector.layers.": None,
         }
     )
 
@@ -1591,6 +1700,7 @@ class IsaacForConditionalGeneration(
                 vision_cfg=vision_cfg,
                 hidden_dim=hidden_dim,
                 output_dim=config.hidden_size,
+                projector_config=getattr(config, "projector_config", None),
                 quant_config=quant_config,
                 prefix=maybe_prefix(prefix, "vision_embedding"),
             )
@@ -1667,7 +1777,14 @@ class IsaacForConditionalGeneration(
                 image_grid_thw.shape[0], dtype=torch.int32, device=image_grid_thw.device
             )
 
-        # TensorSchema will automatically validate shapes on initialization
+        total_tiles = int(image_num_tiles.sum().item())
+        if total_tiles != int(image_grid_thw.shape[0]):
+            raise ValueError(
+                "image_num_tiles must sum to image_grid_thw rows: "
+                f"sum(image_num_tiles)={total_tiles}, image_grid_thw_rows={int(image_grid_thw.shape[0])}"
+            )
+
+        # TensorSchema will automatically validate remaining shapes on initialization
         return IsaacImagePixelInputs(
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
