@@ -1,0 +1,47 @@
+{
+  "model_type": "datnanovlm",
+  "architectures": ["DatnaNoVLMForConditionalGeneration"],
+  "config_fields": {
+    "required": [
+      "model_type",
+      "llm_backbone",
+      "vision_backbone",
+      "projector_config",
+      "image_tokens_per_image",
+      "special_token_ids"
+    ],
+    "derived_or_nested": [
+      "text_config",
+      "vision_config",
+      "vision_max_num_patches",
+      "pixel_shuffle_factor_height",
+      "pixel_shuffle_factor_width",
+      "min_num_tiles",
+      "max_num_tiles",
+      "use_thumbnail"
+    ]
+  },
+  "checkpoint_key_namespaces": {
+    "text": "llm_backbone.*",
+    "vision": "vision_backbone.*",
+    "projector": "multi_modal_projector.*"
+  },
+  "hf_to_vllm_mapping": {
+    "llm_backbone.model.": "language_model.model.",
+    "llm_backbone.lm_head.": "language_model.lm_head.",
+    "llm_backbone.": "language_model.",
+    "vision_backbone.model.": "vision_embedding.transformer.",
+    "vision_backbone.": "vision_embedding.",
+    "multi_modal_projector.linear_1.": "multi_modal_projector.0.",
+    "multi_modal_projector.linear_2.": "multi_modal_projector.2."
+  },
+  "mm_token_budget_formula": {
+    "source": "internvl-derived dynamic tiling",
+    "formula": "sum_over_tiles(tile_h * tile_w) / (pixel_shuffle_factor_height * pixel_shuffle_factor_width)",
+    "notes": [
+      "tile_h and tile_w are post-patch token grid dims per tile",
+      "tile count derived from InternVL target ratio selection",
+      "use_thumbnail contributes one additional tile when enabled"
+    ]
+  }
+}
