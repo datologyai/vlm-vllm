@@ -907,8 +907,12 @@ def fork_new_process_for_each_test(func: Callable[_P, None]) -> Callable[_P, Non
     @functools.wraps(func)
     def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> None:
         # Make the process the leader of its own process group
-        # to avoid sending SIGTERM to the parent process
-        os.setpgrp()
+        # to avoid sending SIGTERM to the parent process.
+        # In restricted runtimes this may raise EPERM; continue in that case.
+        try:
+            os.setpgrp()
+        except PermissionError:
+            pass
         from _pytest.outcomes import Skipped
 
         # Create a unique temporary file to store exception info from child

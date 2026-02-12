@@ -6,6 +6,7 @@ from functools import partial
 
 import numpy as np
 import pytest
+from huggingface_hub.errors import HfHubHTTPError
 from mistral_common.protocol.instruct.chunk import ImageChunk, TextChunk
 from mistral_common.protocol.instruct.messages import UserMessage
 from mistral_common.protocol.instruct.request import ChatCompletionRequest
@@ -411,12 +412,19 @@ def test_processing_correctness(
             "servers that often refuse connections in CI"
         )
 
-    _test_processing_correctness(
-        model_id,
-        hit_rate=hit_rate,
-        num_batches=num_batches,
-        simplify_rate=simplify_rate,
-    )
+    try:
+        _test_processing_correctness(
+            model_id,
+            hit_rate=hit_rate,
+            num_batches=num_batches,
+            simplify_rate=simplify_rate,
+        )
+    except HfHubHTTPError as e:
+        response = getattr(e, "response", None)
+        status_code = getattr(response, "status_code", None)
+        if status_code is not None and status_code >= 500:
+            pytest.skip(f"Transient Hugging Face Hub error ({status_code}) for {model_id}: {e}")
+        raise
 
 
 def _assert_inputs_equal(
