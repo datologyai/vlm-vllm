@@ -3,11 +3,17 @@
 import torch
 from PIL import Image
 
+from vllm.model_executor.models.datnanovlm import (
+    DatNanoVLMProcessor,
+    IMAGE_PAD_TOKEN,
+    VISION_END_TOKEN,
+    VISION_START_TOKEN,
+)
 from vllm.model_executor.models.internvl import (
     calculate_internvl_targets,
     get_internvl_target_ratios,
 )
-from vllm.model_executor.models.isaac import IsaacImageProcessor, IsaacProcessor
+from vllm.model_executor.models.isaac import IsaacImageProcessor
 from vllm.transformers_utils.configs.datnanovlm import DatNanoVLMConfig
 
 
@@ -33,7 +39,7 @@ def _make_nativeres_config() -> DatNanoVLMConfig:
     )
 
 
-def _make_processor_from_config(config: DatNanoVLMConfig) -> IsaacProcessor:
+def _make_processor_from_config(config: DatNanoVLMConfig) -> DatNanoVLMProcessor:
     vision_max_num_patches = int(config.vision_max_num_patches)
     image_processor = IsaacImageProcessor(
         {
@@ -52,7 +58,7 @@ def _make_processor_from_config(config: DatNanoVLMConfig) -> IsaacProcessor:
             "use_thumbnail": bool(config.use_thumbnail),
         }
     )
-    return IsaacProcessor(image_processor=image_processor, tokenizer=_DummyTokenizer())
+    return DatNanoVLMProcessor(image_processor=image_processor, tokenizer=_DummyTokenizer())
 
 
 def test_datnanovlm_tiling_blocks_adds_thumbnail_for_multi_tile() -> None:
@@ -111,7 +117,11 @@ def test_datnanovlm_processor_single_tile_shape_math() -> None:
     total_patch_tokens = int(out["image_grid_thw"].prod(dim=-1).sum().item())
     expected_image_pad_tokens = total_patch_tokens // merge_length
     assert expected_image_pad_tokens == 243
-    assert out["input_text"][0].count("<|image_pad|>") == expected_image_pad_tokens
+    prompt = out["input_text"][0]
+    assert prompt.count(VISION_START_TOKEN) == 1
+    assert prompt.count(VISION_END_TOKEN) == 1
+    assert prompt.count(IMAGE_PAD_TOKEN) == expected_image_pad_tokens
+    assert "<image>" not in prompt
 
 
 def test_datnanovlm_processor_dynamic_tiling_shape_math_with_thumbnail() -> None:
@@ -131,4 +141,8 @@ def test_datnanovlm_processor_dynamic_tiling_shape_math_with_thumbnail() -> None
     total_patch_tokens = int(out["image_grid_thw"].prod(dim=-1).sum().item())
     expected_image_pad_tokens = total_patch_tokens // merge_length
     assert expected_image_pad_tokens == 972
-    assert out["input_text"][0].count("<|image_pad|>") == expected_image_pad_tokens
+    prompt = out["input_text"][0]
+    assert prompt.count(VISION_START_TOKEN) == 1
+    assert prompt.count(VISION_END_TOKEN) == 1
+    assert prompt.count(IMAGE_PAD_TOKEN) == expected_image_pad_tokens
+    assert "<image>" not in prompt

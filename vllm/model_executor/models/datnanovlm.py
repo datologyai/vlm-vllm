@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from transformers.image_processing_utils import BatchFeature
+
 from vllm.config import VllmConfig
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.parse import ImageEmbeddingItems, ImageProcessorItems
@@ -122,6 +124,56 @@ class DatNanoVLMProcessor(IsaacProcessor):
             add_generation_prompt=add_generation_prompt,
             **kwargs,
         )
+
+    def __call__(self, text=None, images=None, **kwargs):
+        """Call HF processor and expand `<image>` to training-aligned tokens.
+
+        Isaac expands `<image>` to `<|image_pad|>*N`.
+        DatNanoVLM expects `<|vision_start|><|image_pad|>*N<|vision_end|>`.
+        """
+        result: dict[str, Any] = {}
+
+        if images is not None:
+            image_inputs = self.image_processor.preprocess(images, **kwargs)
+            image_grid_thw = image_inputs["image_grid_thw"]
+            image_num_tiles = image_inputs["image_num_tiles"]
+            result.update(image_inputs)
+
+            if text is not None:
+                if not isinstance(text, list):
+                    text = [text]
+
+                text = text.copy()  # below lines change text in-place
+                factor_h, factor_w = self.image_processor.pixel_shuffle_factors
+                merge_length = factor_h * factor_w
+                tile_index = 0
+                source_image_index = 0
+
+                for i in range(len(text)):
+                    while self.image_token in text[i]:
+                        num_tiles = int(image_num_tiles[source_image_index])
+                        total_tokens = 0
+                        for _ in range(num_tiles):
+                            total_tokens += int(image_grid_thw[tile_index].prod()) // (
+                                merge_length
+                            )
+                            tile_index += 1
+
+                        text[i] = text[i].replace(
+                            self.image_token,
+                            VISION_START_TOKEN
+                            + ("<|placeholder|>" * total_tokens)
+                            + VISION_END_TOKEN,
+                            1,
+                        )
+                        source_image_index += 1
+
+                    text[i] = text[i].replace("<|placeholder|>", IMAGE_PAD_TOKEN)
+
+        if text is not None:
+            result.update(self.tokenizer(text, **kwargs))
+
+        return BatchFeature(result)
 
 
 class DatNanoVLMProcessingInfo(IsaacProcessingInfo):
