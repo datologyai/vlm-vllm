@@ -4,6 +4,7 @@ import torch
 from PIL import Image
 
 from vllm.model_executor.models.datnanovlm import (
+    DatNanoVLMImageProcessor,
     DatNanoVLMProcessor,
     IMAGE_PAD_TOKEN,
     VISION_END_TOKEN,
@@ -13,7 +14,6 @@ from vllm.model_executor.models.internvl import (
     calculate_internvl_targets,
     get_internvl_target_ratios,
 )
-from vllm.model_executor.models.isaac import IsaacImageProcessor
 from vllm.transformers_utils.configs.datnanovlm import DatNanoVLMConfig
 
 
@@ -41,7 +41,7 @@ def _make_nativeres_config() -> DatNanoVLMConfig:
 
 def _make_processor_from_config(config: DatNanoVLMConfig) -> DatNanoVLMProcessor:
     vision_max_num_patches = int(config.vision_max_num_patches)
-    image_processor = IsaacImageProcessor(
+    image_processor = DatNanoVLMImageProcessor(
         {
             "patch_size": int(config.video_patch_size),
             "vision_max_num_patches": vision_max_num_patches,
