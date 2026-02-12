@@ -42,11 +42,56 @@ class DatNanoVLMConfig(IsaacConfig):
         if vision_config is None:
             vision_config = {}
 
+        patch_size = vision_config.get("patch_size")
+        patch_size_int = int(patch_size) if patch_size is not None else None
+
         if "architectures" not in kwargs:
             kwargs["architectures"] = ["DatNanoVLMForConditionalGeneration"]
 
-        if image_tokens_per_image is not None and "vision_max_num_patches" not in kwargs:
-            kwargs["vision_max_num_patches"] = int(image_tokens_per_image)
+        # Ensure the Isaac processing config matches the vision backbone.
+        # This is distinct from `vision_config.patch_size`, which is used by
+        # the model itself.
+        if patch_size_int is not None and "vision_patch_size" not in kwargs:
+            kwargs["vision_patch_size"] = patch_size_int
+
+        factor_h = kwargs.get("pixel_shuffle_factor_height")
+        factor_w = kwargs.get("pixel_shuffle_factor_width")
+        if factor_h is not None:
+            factor_h = int(factor_h)
+        if factor_w is not None:
+            factor_w = int(factor_w)
+        if factor_h is not None or factor_w is not None:
+            if factor_h is None or factor_w is None:
+                raise ValueError(
+                    "DatNanoVLMConfig requires both pixel_shuffle_factor_height and "
+                    "pixel_shuffle_factor_width when specifying pixel shuffle factors."
+                )
+
+            existing_h = vision_config.get("pixel_shuffle_factor_height")
+            existing_w = vision_config.get("pixel_shuffle_factor_width")
+            if existing_h is not None and int(existing_h) != factor_h:
+                raise ValueError(
+                    "pixel_shuffle_factor_height mismatch between top-level config "
+                    f"({factor_h}) and vision_config ({existing_h})."
+                )
+            if existing_w is not None and int(existing_w) != factor_w:
+                raise ValueError(
+                    "pixel_shuffle_factor_width mismatch between top-level config "
+                    f"({factor_w}) and vision_config ({existing_w})."
+                )
+            vision_config["pixel_shuffle_factor_height"] = factor_h
+            vision_config["pixel_shuffle_factor_width"] = factor_w
+
+        # `vision_max_num_patches` is a preprocessing constraint on the
+        # *pre-shuffle* patch tokens per tile. It should not be set to the
+        # post-shuffle `image_tokens_per_image` value.
+        if "vision_max_num_patches" not in kwargs:
+            tile_size = kwargs.get("tile_size")
+            tile_size_int = int(tile_size) if tile_size is not None else None
+            if tile_size_int is not None and patch_size_int is not None:
+                kwargs["vision_max_num_patches"] = (
+                    tile_size_int // patch_size_int
+                ) ** 2
 
         super().__init__(text_config=text_config, vision_config=vision_config, **kwargs)
 
@@ -59,5 +104,6 @@ class DatNanoVLMConfig(IsaacConfig):
             int(image_tokens_per_image)
             if image_tokens_per_image is not None
             else int(self.vision_max_num_patches)
+            // int(self.pixel_shuffle_factor_height * self.pixel_shuffle_factor_width)
         )
         self.special_token_ids = special_token_ids if special_token_ids is not None else {}
