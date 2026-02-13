@@ -124,7 +124,7 @@ class DatNanoVLMConfig(IsaacConfig):
             ),
         )
 
-        dynamic_image_size = bool(kwargs.pop("dynamic_image_size", False))
+        dynamic_image_size = bool(kwargs.pop("dynamic_image_size", True))
         tile_size = kwargs.pop("tile_size", vision_config.get("image_size", 384))
         tile_size_int = int(tile_size) if tile_size is not None else 384
         min_num_tiles = int(kwargs.pop("min_num_tiles", 1))

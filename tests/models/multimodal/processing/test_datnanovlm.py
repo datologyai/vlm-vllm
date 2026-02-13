@@ -100,6 +100,37 @@ def test_datnanovlm_config_maps_siglip2_nativeres_fields() -> None:
     assert int(config.image_tokens_per_image) == 243
 
 
+def test_datnanovlm_config_defaults_dynamic_image_size_to_true() -> None:
+    config = DatNanoVLMConfig(
+        image_tokens_per_image=243,
+        vision_config={"patch_size": 14},
+        pixel_shuffle_factor_height=3,
+        pixel_shuffle_factor_width=1,
+        tile_size=384,
+        min_num_tiles=1,
+        max_num_tiles=12,
+        use_thumbnail=True,
+    )
+
+    assert bool(config.dynamic_image_size) is True
+
+
+def test_datnanovlm_config_allows_disabling_dynamic_image_size() -> None:
+    config = DatNanoVLMConfig(
+        image_tokens_per_image=243,
+        vision_config={"patch_size": 14},
+        pixel_shuffle_factor_height=3,
+        pixel_shuffle_factor_width=1,
+        dynamic_image_size=False,
+        tile_size=384,
+        min_num_tiles=1,
+        max_num_tiles=12,
+        use_thumbnail=True,
+    )
+
+    assert bool(config.dynamic_image_size) is False
+
+
 def test_datnanovlm_processor_single_tile_shape_math() -> None:
     config = _make_nativeres_config()
     processor = _make_processor_from_config(config)
