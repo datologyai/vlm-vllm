@@ -386,6 +386,26 @@ class DatNanoVLMImageProcessor:
             tiles = self._resolve_tiles(image)
             image_num_tiles.append(len(tiles))
 
+            for tile in tiles:
+                # HF SigLIP preprocessing (resize->tile_size, rescale 1/255, normalize mean/std=0.5).
+                hf_out = self._hf_siglip(images=tile, return_tensors="pt")
+                pixel = hf_out["pixel_values"][0]  # [3,H,W]
+
+                # Extract valid (floor) non-overlapping patches (conv/valid semantics).
+                ps = int(self.patch_size)
+                patches = (
+                    pixel.unfold(1, ps, ps)
+                    .unfold(2, ps, ps)
+                    .permute(1, 2, 0, 3, 4)
+                    .contiguous()
+                )
+                hp, wp = int(patches.shape[0]), int(patches.shape[1])
+                pixel_values = patches.reshape(hp * wp, 3 * ps * ps)
+
+                image_grid_thw = torch.tensor([1, hp, wp]).unsqueeze(0)
+                all_pixel_values.append(pixel_values)
+                all_image_grids.append(image_grid_thw)
+
         if all_pixel_values:
             final_pixel_values = torch.cat(all_pixel_values, dim=0)
             final_image_grids = torch.cat(all_image_grids, dim=0)
@@ -401,6 +421,7 @@ class DatNanoVLMImageProcessor:
             },
             tensor_type=return_tensors,
         )
+
 
 
 class DatNanoVLMProcessor(IsaacProcessor):
