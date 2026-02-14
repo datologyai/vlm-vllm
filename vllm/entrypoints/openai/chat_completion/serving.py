@@ -1929,4 +1929,3 @@ class OpenAIServingChat(OpenAIServing):
             engine_prompt["cache_salt"] = request.cache_salt
 
         return messages, [engine_prompt]
-
