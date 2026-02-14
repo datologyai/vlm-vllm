@@ -948,11 +948,14 @@ class DatNanoVLMVisionEmbedding(nn.Module):
         if activation == "tanh":
             return nn.Tanh()
         return nn.GELU()
-
     def forward(
         self, packed_seq_patches: tuple[torch.Tensor, torch.Tensor]
     ) -> torch.Tensor:
         hidden_states = self.transformer(packed_seq_patches)
+        hidden_states = self.layers(hidden_states)
+        return hidden_states
+
+
 @MULTIMODAL_REGISTRY.register_processor(
     DatNanoVLMMultiModalProcessor,
     info=DatNanoVLMProcessingInfo,
