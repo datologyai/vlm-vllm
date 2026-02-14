@@ -386,51 +386,6 @@ class DatNanoVLMImageProcessor:
             tiles = self._resolve_tiles(image)
             image_num_tiles.append(len(tiles))
 
-            if os.getenv("VLLM_MM_TRACE_TILES", "0") == "1":
-                factor_h, factor_w = self.pixel_shuffle_factors
-                merge_length = factor_h * factor_w
-                tokens_per_tile = (self.tile_size // self.patch_size) ** 2 // merge_length
-                w, h = getattr(image, "size", (None, None))
-                print(
-                    "[mm_tiles] image_size=%s tile_size=%s patch_size=%s factors=%s use_thumbnail=%s dynamic_image_size=%s tiles=%s tokens_per_tile=%s expected_pads=%s"
-                    % (
-                        (w, h),
-                        int(self.tile_size),
-                        int(self.patch_size),
-                        (int(factor_h), int(factor_w)),
-                        bool(self.use_thumbnail),
-                        bool(self.dynamic_image_size),
-                        int(len(tiles)),
-                        int(tokens_per_tile),
-                        int(tokens_per_tile) * int(len(tiles)),
-                    )
-                )
-
-            for tile in tiles:
-                # HF SigLIP preprocessing (resize->tile_size, rescale 1/255, normalize mean/std=0.5).
-                hf_out = self._hf_siglip(images=tile, return_tensors="pt")
-                pixel = hf_out["pixel_values"][0]  # [3,H,W]
-
-                # Extract valid (floor) non-overlapping patches (conv/valid semantics).
-                ps = int(self.patch_size)
-                patches = (
-                    pixel.unfold(1, ps, ps)
-                    .unfold(2, ps, ps)
-                    .permute(1, 2, 0, 3, 4)
-                    .contiguous()
-                )
-                hp, wp = int(patches.shape[0]), int(patches.shape[1])
-                patches = patches.view(hp, wp, 3 * ps * ps)
-                pixel_values = patches.view(hp * wp, 3 * ps * ps)
-
-                if os.getenv("VLLM_MM_TRACE_TILES", "0") == "1":
-                    tile_w, tile_h = getattr(tile, "size", (None, None))
-                    print("[mm_tile] tile_size=%s patch_size=%s hp=%s wp=%s" % ((tile_w, tile_h), ps, hp, wp))
-
-                image_grid_thw = torch.tensor([1, hp, wp]).unsqueeze(0)
-                all_pixel_values.append(pixel_values)
-                all_image_grids.append(image_grid_thw)
-
         if all_pixel_values:
             final_pixel_values = torch.cat(all_pixel_values, dim=0)
             final_image_grids = torch.cat(all_image_grids, dim=0)
@@ -570,25 +525,6 @@ class DatNanoVLMProcessor(IsaacProcessor):
                                 merge_length
                             )
                             tile_index += 1
-
-                        if os.getenv("VLLM_MM_TRACE_TILES", "0") == "1":
-                            print(
-                                "[mm_placeholder] num_tiles=%s total_tokens=%s merge_length=%s tile_index_end=%s"
-                                % (
-                                    int(num_tiles),
-                                    int(total_tokens),
-                                    int(merge_length),
-                                    int(tile_index),
-                                )
-                            )
-                        text[i] = text[i].replace(
-                            self.image_token,
-                            VISION_START_TOKEN
-                            + ("<|placeholder|>" * total_tokens)
-                            + VISION_END_TOKEN,
-                            1,
-                        )
-                        source_image_index += 1
 
                     text[i] = text[i].replace("<|placeholder|>", IMAGE_PAD_TOKEN)
 
@@ -835,26 +771,6 @@ class DatNanoVLMVisionTransformer(Siglip2VisionTransformer):
         )
         hidden_states = self.post_layernorm(hidden_states)
 
-        if os.getenv("VLLM_MM_TRACE_SHAPES", "0") == "1" and not getattr(self, "_mm_shapes_logged", False):
-            self._mm_shapes_logged = True
-            grids = token_grids
-            if isinstance(grids, torch.Tensor):
-                grids = grids.detach().cpu().tolist()
-            print("[mm_shapes] vision_pre_shuffle hidden=%s token_grids=%s factors=%s" % (tuple(hidden_states.shape), grids, self.pixel_shuffle_factors))
-
-        if self.pixel_shuffle_factors != (1, 1):
-            hidden_states = _pixel_shuffle_varlen_datnano(
-                x=hidden_states,
-                token_grids=token_grids,
-                scale_factor=self.pixel_shuffle_factors,
-            )
-
-            if os.getenv("VLLM_MM_TRACE_SHAPES", "0") == "1":
-                print("[mm_shapes] vision_post_shuffle hidden=%s" % (tuple(hidden_states.shape),))
-
-        hidden_states = hidden_states.squeeze(0)
-        return hidden_states
-
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
             ("qkv_proj", "q_proj", "q"),
@@ -1008,16 +924,6 @@ class DatNanoVLMVisionEmbedding(nn.Module):
         self, packed_seq_patches: tuple[torch.Tensor, torch.Tensor]
     ) -> torch.Tensor:
         hidden_states = self.transformer(packed_seq_patches)
-        if os.getenv("VLLM_MM_TRACE_SHAPES", "0") == "1" and not getattr(self, "_mm_proj_logged", False):
-            self._mm_proj_logged = True
-            in_dim = int(hidden_states.shape[-1]) if hidden_states.ndim > 0 else None
-            w0 = getattr(self.linear_fc1, "weight", None)
-            wshape = tuple(w0.shape) if isinstance(w0, torch.Tensor) else None
-            print("[mm_shapes] projector_input hidden=%s in_dim=%s linear_fc1_weight=%s" % (tuple(hidden_states.shape), in_dim, wshape))
-        hidden_states = self.layers(hidden_states)
-        return hidden_states
-
-
 @MULTIMODAL_REGISTRY.register_processor(
     DatNanoVLMMultiModalProcessor,
     info=DatNanoVLMProcessingInfo,

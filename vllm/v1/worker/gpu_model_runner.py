@@ -2483,28 +2483,6 @@ class GPUModelRunner(
                 if (is_embed := pos_info.is_embed) is not None:
                     is_embed = is_embed[start_idx:end_idx]
                     mm_embeds_item = encoder_output[curr_embeds_start:curr_embeds_end]
-                    if os.getenv("VLLM_MM_TRACE_ALIGN", "0") == "1":
-                        expected = end_idx - start_idx
-                        if is_embed is not None:
-                            # is_embed is a boolean mask for which placeholder positions consume embeds.
-                            if isinstance(is_embed, torch.Tensor):
-                                expected = int(is_embed.sum().item())
-                            else:
-                                expected = int(sum(bool(x) for x in is_embed))
-                        got = int(mm_embeds_item.shape[0])
-                        logger.info(
-                            "[mm_align] req_id=%s mm_hash=%s start_pos=%s num_encoder_tokens=%s token_range=%s..%s embed_idx=%s..%s expected_embeds=%s got_embeds=%s",
-                            req_id,
-                            mm_hash,
-                            start_pos,
-                            num_encoder_tokens,
-                            start_idx,
-                            end_idx,
-                            curr_embeds_start,
-                            curr_embeds_end,
-                            expected,
-                            got,
-                        )
                 else:
                     mm_embeds_item = encoder_output[start_idx:end_idx]
 
