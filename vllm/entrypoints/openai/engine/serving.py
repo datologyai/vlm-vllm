@@ -1,3 +1,4 @@
+import os
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
@@ -1285,6 +1286,82 @@ class OpenAIServing:
             priority=priority,
             data_parallel_rank=data_parallel_rank,
         )
+
+        if os.getenv("VLLM_MM_TRACE", "0") == "1":
+            # Print once-per-request engine-side multimodal routing facts.
+            mm_features = engine_request.mm_features or []
+            mm_positions = [
+                {
+                    "modality": f.modality,
+                    "identifier": f.identifier,
+                    "offset": int(f.mm_position.offset),
+                    "length": int(f.mm_position.length),
+                }
+                for f in mm_features
+            ]
+            tokenizer = self.engine_client.renderer.tokenizer
+            pad_id = tokenizer.convert_tokens_to_ids("<|image_pad|>")
+            final_ids = engine_request.prompt_token_ids or []
+            pad_cnt = (
+                sum(1 for t in final_ids if t == pad_id)
+                if isinstance(pad_id, int) and pad_id >= 0
+                else 0
+            )
+            vision_start_id = tokenizer.convert_tokens_to_ids("<|vision_start|>")
+            if vision_start_id is None:
+                vision_start_id = -1
+            vision_end_id = tokenizer.convert_tokens_to_ids("<|vision_end|>")
+            if vision_end_id is None:
+                vision_end_id = -1
+            span_offset = None
+            span_length = None
+            pad_in_span = 0
+            vs_in_span = 0
+            ve_in_span = 0
+            window_head_ids = []
+            window_head_tokens = []
+            window_tail_ids = []
+            window_tail_tokens = []
+            if mm_features:
+                f0 = mm_features[0]
+                span_offset = int(f0.mm_position.offset)
+                span_length = int(f0.mm_position.length)
+                span_ids = final_ids[span_offset:span_offset + span_length]
+                if isinstance(pad_id, int) and pad_id >= 0:
+                    pad_in_span = sum(1 for t in span_ids if t == pad_id)
+                if isinstance(vision_start_id, int) and vision_start_id >= 0:
+                    vs_in_span = sum(1 for t in span_ids if t == vision_start_id)
+                if isinstance(vision_end_id, int) and vision_end_id >= 0:
+                    ve_in_span = sum(1 for t in span_ids if t == vision_end_id)
+                w = 8
+                head_l = max(0, span_offset - w)
+                head_r = min(len(final_ids), span_offset + w)
+                tail_l = max(0, span_offset + span_length - w)
+                tail_r = min(len(final_ids), span_offset + span_length + w)
+                window_head_ids = final_ids[head_l:head_r]
+                window_head_tokens = tokenizer.convert_ids_to_tokens(window_head_ids)
+                window_tail_ids = final_ids[tail_l:tail_r]
+                window_tail_tokens = tokenizer.convert_ids_to_tokens(window_tail_ids)
+            logger.info(
+                "[mm_trace] request_id=%s prompt_len=%s mm_items=%s mm_positions=%s image_pad_id=%s image_pad_id_count=%s vision_start_id=%s vision_end_id=%s span_offset=%s span_length=%s pad_in_span=%s vs_in_span=%s ve_in_span=%s window_head_ids=%s window_head_tokens=%s window_tail_ids=%s window_tail_tokens=%s",
+                request_id,
+                len(final_ids),
+                len(mm_features),
+                mm_positions,
+                pad_id,
+                pad_cnt,
+                vision_start_id,
+                vision_end_id,
+                span_offset,
+                span_length,
+                pad_in_span,
+                vs_in_span,
+                ve_in_span,
+                window_head_ids,
+                window_head_tokens,
+                window_tail_ids,
+                window_tail_tokens,
+            )
         return engine_request, tokenization_kwargs
 
     async def _render_next_turn(
