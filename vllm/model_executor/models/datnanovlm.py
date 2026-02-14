@@ -536,7 +536,6 @@ class DatNanoVLMProcessor(IsaacProcessor):
                 merge_length = factor_h * factor_w
                 tile_index = 0
                 source_image_index = 0
-
                 for i in range(len(text)):
                     while self.image_token in text[i]:
                         num_tiles = int(image_num_tiles[source_image_index])
@@ -546,6 +545,15 @@ class DatNanoVLMProcessor(IsaacProcessor):
                                 merge_length
                             )
                             tile_index += 1
+
+                        text[i] = text[i].replace(
+                            self.image_token,
+                            VISION_START_TOKEN
+                            + ("<|placeholder|>" * total_tokens)
+                            + VISION_END_TOKEN,
+                            1,
+                        )
+                        source_image_index += 1
 
                     text[i] = text[i].replace("<|placeholder|>", IMAGE_PAD_TOKEN)
 
