@@ -779,7 +779,6 @@ class DatNanoVLMVisionTransformer(Siglip2VisionTransformer):
     ):
         super().__init__(config, quant_config=quant_config, prefix=prefix)
         self.pixel_shuffle_factors = _resolve_datnano_pixel_shuffle_factors(config=config)
-
     def forward(
         self,
         packed_seq_patches: tuple[torch.Tensor, torch.Tensor],
@@ -799,6 +798,17 @@ class DatNanoVLMVisionTransformer(Siglip2VisionTransformer):
             max_seqlen=max_seqlen,
         )
         hidden_states = self.post_layernorm(hidden_states)
+
+        if self.pixel_shuffle_factors != (1, 1):
+            hidden_states = _pixel_shuffle_varlen_datnano(
+                x=hidden_states,
+                token_grids=token_grids,
+                scale_factor=self.pixel_shuffle_factors,
+            )
+
+        hidden_states = hidden_states.squeeze(0)
+        return hidden_states
+
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
