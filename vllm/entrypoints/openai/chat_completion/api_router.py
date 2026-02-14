@@ -4,8 +4,6 @@
 
 from http import HTTPStatus
 
-from typing import Any
-
 from fastapi import APIRouter, Depends, FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -22,31 +20,11 @@ from vllm.entrypoints.utils import (
     with_cancellation,
 )
 from vllm.logger import init_logger
-from vllm.multimodal.media import MediaWithBytes
 
 logger = init_logger(__name__)
 
 router = APIRouter()
 ENDPOINT_LOAD_METRICS_FORMAT_HEADER_LABEL = "endpoint-load-metrics-format"
-
-
-def _make_jsonable(obj: Any) -> Any:
-    if isinstance(obj, MediaWithBytes):
-        return {"type": type(obj.media).__name__, "num_bytes": len(obj.original_bytes)}
-
-    if isinstance(obj, bytes):
-        return {"type": "bytes", "num_bytes": len(obj)}
-
-    if isinstance(obj, dict):
-        return {k: _make_jsonable(v) for k, v in obj.items()}
-
-    if isinstance(obj, list):
-        return [_make_jsonable(v) for v in obj]
-
-    if isinstance(obj, tuple):
-        return [_make_jsonable(v) for v in obj]
-
-    return obj
 
 
 def chat(request: Request) -> OpenAIServingChat | None:
@@ -123,8 +101,7 @@ async def render_chat_completion(request: ChatCompletionRequest, raw_request: Re
     if isinstance(result, ErrorResponse):
         return JSONResponse(content=result.model_dump(), status_code=result.error.code)
 
-    return JSONResponse(content=_make_jsonable(result))
-
+    return JSONResponse(content=result)
 
 
 def attach_router(app: FastAPI):
