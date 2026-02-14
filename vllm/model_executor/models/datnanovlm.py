@@ -12,6 +12,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers.image_processing_utils import BatchFeature
+from transformers.models.siglip.image_processing_siglip import SiglipImageProcessor
 from transformers.tokenization_utils import TensorType
 from typing_extensions import TypedDict, Unpack
 
@@ -345,6 +346,18 @@ class DatNanoVLMImageProcessor:
         self.max_num_tiles = kwargs.pop("max_num_tiles", self.max_num_tiles)
         self.use_thumbnail = kwargs.pop("use_thumbnail", self.use_thumbnail)
 
+        # Use HF SiglipImageProcessor codepath for resize/rescale/normalize parity.
+        self._hf_siglip = SiglipImageProcessor(
+            do_resize=True,
+            size={"height": int(self.tile_size), "width": int(self.tile_size)},
+            resample=2,  # PIL bilinear
+            do_rescale=True,
+            rescale_factor=1.0 / 255.0,
+            do_normalize=True,
+            image_mean=[0.5, 0.5, 0.5],
+            image_std=[0.5, 0.5, 0.5],
+        )
+
     def _resolve_tiles(self, image: PIL.Image.Image) -> list[PIL.Image.Image]:
         if not self.dynamic_image_size:
             return [image]
@@ -394,50 +407,27 @@ class DatNanoVLMImageProcessor:
                 )
 
             for tile in tiles:
-                image_tensor = extract_image_pil(tile)
+                # HF SigLIP preprocessing (resize->tile_size, rescale 1/255, normalize mean/std=0.5).
+                hf_out = self._hf_siglip(images=tile, return_tensors="pt")
+                pixel = hf_out["pixel_values"][0]  # [3,H,W]
 
-                tile_w, tile_h = getattr(tile, "size", (None, None))
+                # Extract valid (floor) non-overlapping patches (conv/valid semantics).
+                ps = int(self.patch_size)
+                patches = (
+                    pixel.unfold(1, ps, ps)
+                    .unfold(2, ps, ps)
+                    .permute(1, 2, 0, 3, 4)
+                    .contiguous()
+                )
+                hp, wp = int(patches.shape[0]), int(patches.shape[1])
+                patches = patches.view(hp, wp, 3 * ps * ps)
+                pixel_values = patches.view(hp * wp, 3 * ps * ps)
 
-                if (
-                    self.dynamic_image_size
-                    and tile_w == self.tile_size
-                    and tile_h == self.tile_size
-                ):
-                    # InternVL dynamic tiler already returns tile_size x tile_size tiles.
-                    # Keep patch grid aligned with training (e.g., 384/14 = 27 per side for SigLIP2).
-                    images = image_tensor
-                    if images.dim() == 3:
-                        images = images.unsqueeze(0)
-                    images = prepare_image_tensor(images)
-
-                    # SigLIP2 patchify requires H/W divisible by patch_size.
-                    _, h, w, _ = images.shape
-                    target_h = (h // self.patch_size) * self.patch_size
-                    target_w = (w // self.patch_size) * self.patch_size
-                    if target_h != h or target_w != w:
-                        top = (h - target_h) // 2
-                        left = (w - target_w) // 2
-                        images = images[:, top : top + target_h, left : left + target_w, :]
-
-                    patches = patchify_vision(images, patch_size=self.patch_size)
-                else:
-                    # Fallback for vLLM dummy/profiling images or any non-tile-sized input.
-                    patches, _ = _process_vision_for_patches_datnano(
-                        image_tensor,
-                        patch_size=self.patch_size,
-                        max_num_patches=self.vision_max_num_patches,
-                        min_num_patches=self.vision_min_num_patches,
-                        pixel_shuffle_scale=self.pixel_shuffle_factors,
-                    )
-
-                patches = patches.unsqueeze(1)
-
-                hp, wp, dim = patches.shape[-3], patches.shape[-2], patches.shape[-1]
-                current_num_patches = hp * wp
-                pixel_values = patches.reshape(current_num_patches, dim)
+                if os.getenv("VLLM_MM_TRACE_TILES", "0") == "1":
+                    tile_w, tile_h = getattr(tile, "size", (None, None))
+                    print("[mm_tile] tile_size=%s patch_size=%s hp=%s wp=%s" % ((tile_w, tile_h), ps, hp, wp))
 
                 image_grid_thw = torch.tensor([1, hp, wp]).unsqueeze(0)
-
                 all_pixel_values.append(pixel_values)
                 all_image_grids.append(image_grid_thw)
 
