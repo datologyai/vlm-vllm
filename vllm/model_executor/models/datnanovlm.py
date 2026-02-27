@@ -56,6 +56,7 @@ VISION_START_TOKEN = "<|vision_start|>"
 VISION_END_TOKEN = "<|vision_end|>"
 IMAGE_PAD_TOKEN = "<|image_pad|>"
 IMAGE_PLACEHOLDER_TOKEN = "<image>"
+MM_BOS_TOKEN = "<|mm_bos|>"
 
 
 def _resolve_datnano_pixel_shuffle_factors(
@@ -686,6 +687,27 @@ class DatNanoVLMImagePixelInputs(TensorSchema):
 
 
 class DatNanoVLMMultiModalProcessor(IsaacMultiModalProcessor):
+    def _apply_hf_processor_main(
+        self,
+        prompt: str | list[int],
+        mm_items: MultiModalDataItems,
+        hf_processor_mm_kwargs: Mapping[str, object],
+        tokenization_kwargs: Mapping[str, object],
+        *,
+        enable_hf_prompt_update: bool,
+    ) -> tuple[list[int], BatchFeature, bool]:
+        prompt_ids, mm_processed_data, is_update_applied = super()._apply_hf_processor_main(
+            prompt=prompt,
+            mm_items=mm_items,
+            hf_processor_mm_kwargs=hf_processor_mm_kwargs,
+            tokenization_kwargs=tokenization_kwargs,
+            enable_hf_prompt_update=enable_hf_prompt_update,
+        )
+        mm_bos_token_id = self.info.get_tokenizer().convert_tokens_to_ids(MM_BOS_TOKEN)
+        if not prompt_ids or prompt_ids[0] != mm_bos_token_id:
+            prompt_ids = [mm_bos_token_id] + prompt_ids
+        return prompt_ids, mm_processed_data, is_update_applied
+
     def _get_mm_fields_config(
         self,
         hf_inputs: BatchFeature,
