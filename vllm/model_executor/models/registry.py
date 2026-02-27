@@ -351,6 +351,7 @@ _MULTIMODAL_MODELS = {
         "Idefics3ForConditionalGeneration",
     ),
     "IsaacForConditionalGeneration": ("isaac", "IsaacForConditionalGeneration"),
+    "DatNanoVLMForConditionalGeneration": ("datnanovlm", "DatNanoVLMForConditionalGeneration"),
     "SmolVLMForConditionalGeneration": ("smolvlm", "SmolVLMForConditionalGeneration"),  # noqa: E501
     "KananaVForConditionalGeneration": ("kanana_v", "KananaVForConditionalGeneration"),
     "KeyeForConditionalGeneration": ("keye", "KeyeForConditionalGeneration"),
